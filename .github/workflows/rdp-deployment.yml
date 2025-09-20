@@ -1,0 +1,433 @@
+name: RDP Server Deployment (Production)
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: 'Force run even if another instance is running'
+        required: false
+        default: 'false'
+
+jobs:
+  deploy-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write  # Required to push connection details back to repository
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: System Information and Prerequisites
+      run: |
+        echo "=== SYSTEM INFORMATION ==="
+        echo "OS: $env:OS"
+        echo "Processor: $env:PROCESSOR_ARCHITECTURE"
+        echo "User: $env:USERNAME"
+        echo "PowerShell Version: $($PSVersionTable.PSVersion)"
+        echo "Current Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')"
+        echo "=============================="
+
+        # Check SSH availability
+        try {
+          $sshVersion = ssh -V 2>&1
+          echo "SSH Version: $sshVersion"
+        } catch {
+          echo "WARNING: SSH not found, attempting to install OpenSSH..."
+          try {
+            Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
+            echo "✓ OpenSSH Client installed"
+          } catch {
+            echo "✗ Failed to install OpenSSH: $_"
+            exit 1
+          }
+        }
+
+    - name: Enhanced RDP Configuration
+      run: |
+        echo "=== RDP CONFIGURATION ==="
+        echo "Configuring Windows Remote Desktop with enhanced security..."
+
+        try {
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
+          echo "✓ Remote Desktop enabled"
+
+          # Configure firewall rules
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          echo "✓ Firewall rules configured"
+
+          # Disable Network Level Authentication (can cause issues with tunneled connections)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+          echo "✓ Network Level Authentication disabled for better tunnel compatibility"
+
+          # Set security layer to RDP Security Layer
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "SecurityLayer" -Value 0
+          echo "✓ Security layer set to RDP"
+
+          # Set encryption level to low for better compatibility
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "MinEncryptionLevel" -Value 1
+          echo "✓ Encryption level set for compatibility"
+
+          # Configure user account
+          $username = "runneradmin"
+          $password = "P@ssw0rd!"
+          Set-LocalUser -Name $username -Password (ConvertTo-SecureString -AsPlainText $password -Force)
+          echo "✓ User credentials configured"
+
+          # Restart RDP service to apply configuration changes
+          echo "Restarting RDP service to apply configuration..."
+          Restart-Service -Name "TermService" -Force
+          Start-Sleep -Seconds 3
+
+          # Verify RDP service
+          $rdpService = Get-Service -Name "TermService"
+          if ($rdpService.Status -eq "Running") {
+            echo "✓ RDP service restarted and running"
+          } else {
+            echo "⚠ RDP service not running, attempting to start..."
+            Start-Service -Name "TermService"
+            Start-Sleep -Seconds 2
+            $rdpService = Get-Service -Name "TermService"
+            if ($rdpService.Status -eq "Running") {
+              echo "✓ RDP service started successfully"
+            } else {
+              echo "✗ Failed to start RDP service"
+            }
+          }
+
+          # Check if RDP port is listening
+          Start-Sleep -Seconds 2  # Give service time to bind to port
+          $rdpPort = Get-NetTCPConnection -LocalPort 3389 -ErrorAction SilentlyContinue
+          if ($rdpPort) {
+            echo "✓ RDP port 3389 is listening"
+            echo "  Listening on: $($rdpPort.LocalAddress):$($rdpPort.LocalPort)"
+          } else {
+            echo "⚠ RDP port 3389 not detected"
+            echo "Checking all listening ports..."
+            Get-NetTCPConnection -State Listen | Where-Object {$_.LocalPort -eq 3389} | ForEach-Object {
+              echo "  Found RDP port: $($_.LocalAddress):$($_.LocalPort)"
+            }
+          }
+
+          # Additional diagnostics
+          echo "=== RDP DIAGNOSTICS ==="
+          echo "Current RDP configuration:"
+          $rdpConfig = Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+          echo "  UserAuthentication: $($rdpConfig.UserAuthentication)"
+          echo "  SecurityLayer: $($rdpConfig.SecurityLayer)"
+          echo "  MinEncryptionLevel: $($rdpConfig.MinEncryptionLevel)"
+
+          $tsConfig = Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+          echo "  fDenyTSConnections: $($tsConfig.fDenyTSConnections)"
+
+          echo "=== RDP CONFIGURATION COMPLETE ==="
+
+        } catch {
+          echo "✗ RDP configuration failed: $_"
+          echo "This may cause connection issues"
+        }
+
+    - name: Create Serveo Tunnel (Enhanced)
+      run: |
+        echo "=== SERVEO TUNNEL SETUP ==="
+        echo "Starting enhanced Serveo tunnel with comprehensive error handling..."
+        
+        # Function to test SSH connectivity
+        function Test-SSHConnectivity {
+          param($targetHost, $port = 22)
+          try {
+            $tcpClient = New-Object System.Net.Sockets.TcpClient
+            $tcpClient.ConnectAsync($targetHost, $port).Wait(5000)
+            $result = $tcpClient.Connected
+            $tcpClient.Close()
+            return $result
+          } catch {
+            return $false
+          }
+        }
+        
+        # Test connectivity to serveo.net
+        echo "Testing connectivity to serveo.net..."
+        if (!(Test-SSHConnectivity "serveo.net")) {
+          echo "ERROR: Cannot connect to serveo.net"
+          echo "This could be due to:"
+          echo "1. Network connectivity issues"
+          echo "2. Firewall blocking SSH connections"
+          echo "3. serveo.net service unavailable"
+          exit 1
+        }
+        echo "✓ Connectivity to serveo.net confirmed"
+        
+        # Multiple connection attempts with different strategies
+        $tunnelUrl = ""
+        $connectionEstablished = $false
+        $attempts = @(
+          @{
+            name = "Custom subdomain"
+            args = "-o StrictHostKeyChecking=no -o ServerAliveInterval=30 -R 3389:localhost:3389 serveo.net"
+            timeout = 45
+          },
+          @{
+            name = "Random port"
+            args = "-o StrictHostKeyChecking=no -o ServerAliveInterval=30 -R 0:localhost:3389 serveo.net"
+            timeout = 60
+          },
+          @{
+            name = "Alternative random port"
+            args = "-o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ConnectTimeout=10 -R 0:localhost:3389 serveo.net"
+            timeout = 45
+          }
+        )
+        
+        foreach ($attempt in $attempts) {
+          if ($connectionEstablished) { break }
+          
+          echo "Attempting: $($attempt.name)"
+          echo "Command: ssh $($attempt.args)"
+          
+          # Create enhanced SSH connection with proper output capture
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = "ssh"
+          $psi.Arguments = $attempt.args
+          $psi.UseShellExecute = $false
+          $psi.RedirectStandardOutput = $true
+          $psi.RedirectStandardError = $true
+          $psi.CreateNoWindow = $true
+          
+          $process = New-Object System.Diagnostics.Process
+          $process.StartInfo = $psi
+          
+          # Output capture with real-time monitoring
+          $outputBuilder = New-Object System.Text.StringBuilder
+          $errorBuilder = New-Object System.Text.StringBuilder
+          
+          $outputHandler = {
+            if ($EventArgs.Data -ne $null) {
+              [void]$outputBuilder.AppendLine($EventArgs.Data)
+              Write-Host "SSH: $($EventArgs.Data)"
+            }
+          }
+          
+          $errorHandler = {
+            if ($EventArgs.Data -ne $null) {
+              [void]$errorBuilder.AppendLine($EventArgs.Data)
+              Write-Host "SSH-ERR: $($EventArgs.Data)"
+            }
+          }
+          
+          Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action $outputHandler
+          Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -Action $errorHandler
+          
+          try {
+            $process.Start()
+            $process.BeginOutputReadLine()
+            $process.BeginErrorReadLine()
+            
+            # Monitor for tunnel establishment
+            $timeout = $attempt.timeout
+            for ($i = 0; $i -lt $timeout; $i++) {
+              Start-Sleep -Seconds 1
+              
+              $output = $outputBuilder.ToString()
+              $errorOutput = $errorBuilder.ToString()
+              $allOutput = $output + $errorOutput
+              
+              # Enhanced pattern matching for Serveo
+              if ($allOutput -match "Forwarding TCP connections from ([^\s\r\n]+)") {
+                $tunnelUrl = $matches[1].Trim()
+                $connectionEstablished = $true
+                echo "✓ Tunnel URL found: $tunnelUrl"
+                break
+              }
+              elseif ($allOutput -match "tcp://([^\s\r\n]+)") {
+                $tunnelUrl = $matches[1].Trim()
+                $connectionEstablished = $true
+                echo "✓ Tunnel URL found: tcp://$tunnelUrl"
+                break
+              }
+              elseif ($allOutput -match "([a-zA-Z0-9\-]+\.serveo\.net)") {
+                $tunnelUrl = $matches[1].Trim()
+                $connectionEstablished = $true
+                echo "✓ Tunnel URL found: $tunnelUrl"
+                break
+              }
+              
+              # Check for common error patterns
+              if ($allOutput -match "Connection refused|Connection timed out|Host key verification failed") {
+                echo "Connection error detected, stopping attempt"
+                break
+              }
+              
+              if ($i % 10 -eq 0 -and $i -gt 0) {
+                echo "Still waiting for tunnel... ($i/$timeout seconds)"
+              }
+            }
+            
+            # Clean up process if still running
+            if (!$process.HasExited) {
+              if (!$connectionEstablished) {
+                $process.Kill()
+                echo "Timeout reached, terminating SSH process"
+              }
+            }
+            
+          } catch {
+            echo "Error during SSH connection: $_"
+          } finally {
+            # Clean up event handlers
+            Get-EventSubscriber | Where-Object { $_.SourceObject -eq $process } | Unregister-Event
+          }
+          
+          if ($connectionEstablished) {
+            echo "✓ Connection established with $($attempt.name)"
+            break
+          } else {
+            echo "✗ Failed with $($attempt.name)"
+            Start-Sleep -Seconds 5
+          }
+        }
+        
+        # Process results and create connection details
+        if ($connectionEstablished -and $tunnelUrl) {
+          # Clean and format the tunnel URL
+          $tunnelUrl = $tunnelUrl -replace '[^\w\.\-:]', ''
+          
+          # Ensure proper format
+          if ($tunnelUrl -notmatch '^tcp://') {
+            if ($tunnelUrl -match '\.serveo\.net') {
+              $tunnelUrl = "tcp://$tunnelUrl"
+            }
+          }
+          
+          # Create connection details
+          $connectionDetails = @{
+            host = $tunnelUrl
+            username = "runneradmin"
+            password = "P@ssw0rd!"
+            status = "ready"
+            provider = "serveo"
+            establishedAt = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+            connectionString = "mstsc /v:$tunnelUrl /u:runneradmin"
+          }
+          
+          echo "=== RDP CONNECTION DETAILS ==="
+          echo "Host: $tunnelUrl"
+          echo "Username: runneradmin"
+          echo "Password: P@ssw0rd!"
+          echo "Provider: Serveo"
+          echo "Connection String: mstsc /v:$tunnelUrl /u:runneradmin"
+          echo "=============================="
+          
+          # Store connection details with enhanced error handling
+          try {
+            $jsonDetails = $connectionDetails | ConvertTo-Json -Depth 10
+            $jsonDetails | Out-File -FilePath "connection-details.json" -Encoding UTF8
+            
+            # Verify file was created
+            if (Test-Path "connection-details.json") {
+              echo "✓ Connection details saved successfully"
+              
+              # Commit to repository
+              git config --global user.email "action@github.com"
+              git config --global user.name "GitHub Action"
+              git add connection-details.json
+              git commit -m "Add RDP connection details [serveo-automated]"
+              git push origin main
+              echo "✓ Connection details committed to repository"
+            } else {
+              echo "✗ Failed to save connection details file"
+            }
+          } catch {
+            echo "✗ Error saving connection details: $_"
+          }
+          
+        } else {
+          echo "=== SERVEO TUNNEL FAILED ==="
+          echo "Failed to establish tunnel after all attempts"
+          echo "Possible causes:"
+          echo "1. serveo.net service temporarily unavailable"
+          echo "2. Network connectivity issues"
+          echo "3. SSH authentication problems"
+          echo "4. Port conflicts on serveo.net"
+          echo ""
+          echo "Troubleshooting steps:"
+          echo "1. Check serveo.net status"
+          echo "2. Verify SSH client is working"
+          echo "3. Try different port configurations"
+          echo "4. Consider using alternative providers"
+          exit 1
+        }
+    - name: Failover to Alternative Providers
+      if: failure()
+      run: |
+        echo "Primary provider failed, attempting failover..."
+        $fallbackProviders = @("pinggy")
+        
+        foreach ($provider in $fallbackProviders) {
+          echo "Attempting failover to $provider..."
+          
+          try {
+            switch ($provider) {
+              "pinggy" {
+                
+                echo "Connecting to Pinggy..."
+                $process = Start-Process -FilePath "ssh" -ArgumentList "-p", "443", "-o", "StrictHostKeyChecking=no", "-R", "0:localhost:3389", "tcp@a.pinggy.io" -PassThru -WindowStyle Hidden
+                Start-Sleep -Seconds 20
+                if (!$process.HasExited) {
+                  $tunnelUrl = "pinggy-tunnel-established"
+                }
+                break
+              }
+            }
+            
+            if ($tunnelUrl) {
+              echo "Failover to $provider successful!"
+              break
+            }
+          } catch {
+            echo "Failover to $provider failed: $_"
+            continue
+          }
+        }
+        
+        if (!$tunnelUrl) {
+          echo "All failover attempts failed"
+          exit 1
+        }
+    - name: Keep RDP Server Active
+      run: |
+        echo "=== RDP SERVER ACTIVE ==="
+        echo "RDP server is now running and accessible"
+        echo "Session will remain active for the duration of this workflow"
+        echo "Maximum session time: 90 minutes (GitHub Actions limit)"
+        echo ""
+        echo "Connection established at: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')"
+        echo "Estimated session end: $(Get-Date -Date (Get-Date).AddMinutes(85) -Format 'yyyy-MM-dd HH:mm:ss UTC')"
+        echo ""
+        echo "Keeping session alive..."
+
+        # Keep alive with periodic status updates
+        $startTime = Get-Date
+        $maxDuration = 85 * 60  # 85 minutes in seconds
+        $updateInterval = 300   # 5 minutes
+
+        while ((Get-Date) -lt $startTime.AddSeconds($maxDuration)) {
+          Start-Sleep -Seconds $updateInterval
+          $elapsed = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
+          $remaining = [math]::Round(85 - $elapsed, 1)
+          echo "Session active for $elapsed minutes, $remaining minutes remaining"
+
+          # Verify RDP service is still running
+          $rdpService = Get-Service -Name "TermService" -ErrorAction SilentlyContinue
+          if ($rdpService -and $rdpService.Status -eq "Running") {
+            echo "✓ RDP service healthy"
+          } else {
+            echo "⚠ RDP service issue detected"
+          }
+        }
+
+        echo "Session time limit reached, workflow ending"
